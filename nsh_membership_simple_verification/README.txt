@@ -1,7 +1,7 @@
 NSH Membership Simple Verification
 ==================================
 
-This is a separate WordPress plugin from the NSH Membership Verification Demo. It provides email-first verification, sign-up and payment-demo steps, and an organizer code validator. It does not process real payments.
+This is a separate WordPress plugin from the NSH Membership Verification Demo. It provides WordPress-account verification, a membership sign-up form, payment/trial demo steps, and an organizer code validator. It does not process real payments.
 
 Install
 -------
@@ -22,10 +22,12 @@ The page slug `membership-verification` is not a shortcode. If you add the page 
 
 Flow
 ----
-Participants enter their email on the verification page. A known paid member receives a code immediately. A known trial or unpaid member continues to the payment demo. An unknown email goes to sign-up first, then to the payment demo.
+The verification page lets existing WordPress users log in and new participants open the sign-up form. A logged-in user's WordPress user-meta value for `site_role` (or `Site Role`, including capitalization, underscore, or hyphen variations) determines the next step: `Active` receives a code; `Unpaid` or `Expired` continues to the payment choices; every other or missing value is directed to contact the Membership Secretary. Array-valued fields and matching WordPress roles such as `active` are also recognized. Sites storing this field under another user-meta key can configure the lookup using the `nshmsv_site_role_meta_keys` filter.
 
-The payment demo offers credit-card/PayPal selection, which only marks the demo member as paid, and a trial option when fewer than three trial uses are recorded. The third trial use completes that event and changes the member's status to unpaid for subsequent events. Unpaid members cannot select trial. The trial limit is checked again when the payment form is submitted.
+The sign-up form collects email, first name, last name, and short hike experience. If the email already belongs to a WordPress user, the participant is asked to log in instead. Otherwise, the participant can choose PayPal, e-transfer, credit card, or an available trial membership. Existing users with an `Unpaid` or `Expired` Site Role can choose PayPal, e-transfer, or credit card. Selecting an option in this demo displays a verification code; it does not process or confirm payment and does not change the WordPress Site Role.
+
+Trial membership is limited to three distinct event uses per email. After the third trial use, future event verifications require a payment choice. The trial limit is checked again when the form is submitted.
 
 For event-specific repeat protection and distinct trial-event counts, add an event identifier to the verification link as `?event=event-id`. A repeat request for the same email and event returns the existing code and does not consume another trial. Without an event identifier, each completed trial submission counts as a trial use.
 
-The organizer page only validates a submitted code and is administrator-only. Payment choices are simulations; use a payment provider and trusted membership records before production use. Email is the demo's identity key, so production verification should also confirm control of the email address.
+The organizer page only validates a submitted code and is administrator-only. Payment choices are simulations; integrate a payment provider and update Site Role only from a trusted payment confirmation before production use. New sign-up email is not verified by this demo, so confirm control of the email address before issuing production membership or codes.

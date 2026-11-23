@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: NSH Membership Simple Verification
- * Description: Simple email-first membership verification, trial/payment demo, and organizer code validation.
- * Version: 1.0.3
+ * Description: WordPress account membership verification, sign-up, trial/payment demo, and organizer code validation.
+ * Version: 1.1.1
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: NSH
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'NSHMSV_DB_VERSION', '1' );
+define( 'NSHMSV_DB_VERSION', '2' );
 define( 'NSHMSV_TRIAL_LIMIT', 3 );
 
 function nshmsv_members_table() {
@@ -40,6 +40,9 @@ function nshmsv_install_tables() {
 		id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
 		email varchar(190) NOT NULL,
 		full_name varchar(190) NOT NULL DEFAULT '',
+		first_name varchar(100) NOT NULL DEFAULT '',
+		last_name varchar(100) NOT NULL DEFAULT '',
+		short_hike_experience text NULL,
 		membership_status varchar(20) NOT NULL DEFAULT 'trial',
 		trials_used smallint(5) unsigned NOT NULL DEFAULT 0,
 		created_at datetime NOT NULL,
@@ -211,23 +214,27 @@ function nshmsv_create_code( $email, $event_ref ) {
 	return new WP_Error( 'nshmsv_code_failed', 'A unique verification code could not be generated. Please try again.' );
 }
 
-function nshmsv_upsert_member( $email, $full_name, $status, $trials_used ) {
+function nshmsv_upsert_member( $email, $full_name, $status, $trials_used, $signup_data = array() ) {
 	global $wpdb;
 
 	$existing = nshmsv_get_member( $email );
 	$now      = current_time( 'mysql' );
+	$data     = array(
+		'full_name'             => $full_name,
+		'first_name'            => isset( $signup_data['first_name'] ) ? $signup_data['first_name'] : '',
+		'last_name'             => isset( $signup_data['last_name'] ) ? $signup_data['last_name'] : '',
+		'short_hike_experience' => isset( $signup_data['short_hike_experience'] ) ? $signup_data['short_hike_experience'] : '',
+		'membership_status'     => $status,
+		'trials_used'           => $trials_used,
+		'updated_at'            => $now,
+	);
 
 	if ( $existing ) {
 		$updated = $wpdb->update(
 			nshmsv_members_table(),
-			array(
-				'full_name'        => $full_name,
-				'membership_status' => $status,
-				'trials_used'      => $trials_used,
-				'updated_at'       => $now,
-			),
+			$data,
 			array( 'email' => $email ),
-			array( '%s', '%s', '%d', '%s' ),
+			array( '%s', '%s', '%s', '%s', '%s', '%d', '%s' ),
 			array( '%s' )
 		);
 
@@ -236,21 +243,20 @@ function nshmsv_upsert_member( $email, $full_name, $status, $trials_used ) {
 
 	$inserted = $wpdb->insert(
 		nshmsv_members_table(),
-		array(
-			'email'             => $email,
-			'full_name'         => $full_name,
-			'membership_status' => $status,
-			'trials_used'       => $trials_used,
-			'created_at'        => $now,
-			'updated_at'        => $now,
+		array_merge(
+			array(
+				'email'               => $email,
+				'created_at'          => $now,
+			),
+			$data
 		),
-		array( '%s', '%s', '%s', '%d', '%s', '%s' )
+		array( '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s' )
 	);
 
 	return 1 === $inserted;
 }
 
-function nshmsv_complete_payment( $email, $full_name, $event_ref, $choice ) {
+function nshmsv_complete_payment( $email, $full_name, $event_ref, $choice, $allow_trial = false ) {
 	global $wpdb;
 
 	if ( false === $wpdb->query( 'START TRANSACTION' ) ) {
@@ -276,13 +282,13 @@ function nshmsv_complete_payment( $email, $full_name, $event_ref, $choice ) {
 		);
 	}
 
-	if ( 'paid' === $member->membership_status || in_array( $choice, array( 'paid', 'credit_card', 'paypal' ), true ) ) {
+	if ( in_array( $choice, array( 'paid', 'credit_card', 'paypal', 'etransfer' ), true ) ) {
 		$new_status = 'paid';
 		$new_trials = (int) $member->trials_used;
-	} elseif ( 'trial' === $choice && (int) $member->trials_used < NSHMSV_TRIAL_LIMIT ) {
+	} elseif ( $allow_trial && 'trial' === $choice && (int) $member->trials_used < NSHMSV_TRIAL_LIMIT ) {
 		$new_trials = (int) $member->trials_used + 1;
 		$new_status = $new_trials >= NSHMSV_TRIAL_LIMIT ? 'unpaid' : 'trial';
-	} elseif ( 'trial' === $choice ) {
+	} elseif ( 'trial' === $choice && (int) $member->trials_used >= NSHMSV_TRIAL_LIMIT ) {
 		$wpdb->query( 'ROLLBACK' );
 		return new WP_Error( 'nshmsv_trial_limit', 'You have used all three trial events. Choose a payment option to continue.' );
 	} else {
@@ -344,17 +350,86 @@ function nshmsv_get_flow( $token, $expected_step = '' ) {
 	return $flow;
 }
 
-function nshmsv_new_flow( $email, $event_ref, $step, $full_name = '' ) {
+function nshmsv_new_flow( $email, $event_ref, $step, $full_name = '', $extra = array() ) {
 	$token = bin2hex( random_bytes( 16 ) );
-	$flow  = array(
+	$flow  = array_merge(
+		array(
 		'email'     => $email,
 		'event_ref' => $event_ref,
 		'step'      => $step,
 		'full_name' => $full_name,
+		),
+		$extra
 	);
 
 	set_transient( 'nshmsv_flow_' . $token, $flow, 30 * MINUTE_IN_SECONDS );
 	return $token;
+}
+
+function nshmsv_get_site_role( $user_id ) {
+	$meta_keys = apply_filters( 'nshmsv_site_role_meta_keys', array( 'site_role', 'Site Role' ) );
+	$user_meta = get_user_meta( $user_id );
+	$lookup    = array();
+
+	foreach ( $user_meta as $meta_key => $values ) {
+		if ( 'siterole' === preg_replace( '/[^a-z0-9]/', '', strtolower( $meta_key ) ) ) {
+			$lookup[ $meta_key ] = isset( $values[0] ) ? $values[0] : '';
+		}
+	}
+
+	foreach ( $meta_keys as $meta_key ) {
+		$meta_key = (string) $meta_key;
+		$value    = array_key_exists( $meta_key, $lookup ) ? $lookup[ $meta_key ] : get_user_meta( $user_id, $meta_key, true );
+		$value    = nshmsv_normalize_site_role( $value );
+		if ( '' !== $value ) {
+			return $value;
+		}
+	}
+
+	foreach ( $lookup as $value ) {
+		$value = nshmsv_normalize_site_role( $value );
+		if ( '' !== $value ) {
+			return $value;
+		}
+	}
+
+	$user = get_userdata( $user_id );
+	if ( $user && ! empty( $user->roles ) ) {
+		foreach ( $user->roles as $role ) {
+			$role = nshmsv_normalize_site_role( $role );
+			if ( in_array( $role, array( 'active', 'unpaid', 'expired' ), true ) ) {
+				return $role;
+			}
+		}
+	}
+
+	return '';
+}
+
+function nshmsv_normalize_site_role( $value ) {
+	if ( is_array( $value ) ) {
+		$unknown = '';
+		foreach ( $value as $item ) {
+			$normalized = nshmsv_normalize_site_role( $item );
+			if ( in_array( $normalized, array( 'active', 'unpaid', 'expired' ), true ) ) {
+				return $normalized;
+			}
+			if ( '' === $unknown && '' !== $normalized ) {
+				$unknown = $normalized;
+			}
+		}
+		return $unknown;
+	}
+
+	if ( ! is_string( $value ) && ! is_numeric( $value ) ) {
+		return '';
+	}
+
+	$value = strtolower( trim( (string) $value ) );
+	$value = preg_replace( '/[\s_]+/', '-', $value );
+	$value = preg_replace( '/-(member|membership)$/', '', $value );
+
+	return $value;
 }
 
 function nshmsv_redirect_to( $url ) {
@@ -387,94 +462,114 @@ function nshmsv_redirect_to( $url ) {
 }
 
 function nshmsv_render_code_result( $result ) {
-	$status_label = 'paid' === $result['status'] ? 'Paid member' : ( 'unpaid' === $result['status'] ? 'Trial limit reached; payment required for future events' : 'Trial member' );
+	$status_label = 'active' === $result['status'] ? 'Active member' : ( 'paid' === $result['status'] ? 'Paid member' : ( 'unpaid' === $result['status'] ? 'Trial limit reached; payment required for future events' : 'Trial member' ) );
 
-	return '<div class="nshmsv-result" role="status"><h3>Verification complete</h3><p>Status: ' . esc_html( $status_label ) . '</p><p>Your verification code:</p><p><strong>' . esc_html( $result['code'] ) . '</strong></p><p>Enter this code in the event RSVP.</p><p>Payment options are demo only; no payment was processed.</p></div>';
+	return '<div class="nshmsv-result" role="status"><h3>Verification complete</h3><p>Status: ' . esc_html( $status_label ) . '</p><p>Your verification code:</p><p><strong>' . esc_html( $result['code'] ) . '</strong></p><p>Enter this code in the event RSVP.</p></div>';
 }
 
 function nshmsv_verification_shortcode() {
-	global $wpdb;
+	$error     = '';
+	$result    = null;
+	$event_ref = nshmsv_get_event_ref();
+	$signup_url = nshmsv_page_url( 'nshmsv_signup_page_id' );
+	if ( '' !== $event_ref ) {
+		$signup_url = add_query_arg( 'event', $event_ref, $signup_url );
+	}
+	$action    = isset( $_POST['nshmsv_action'] ) && is_string( $_POST['nshmsv_action'] ) ? sanitize_key( wp_unslash( $_POST['nshmsv_action'] ) ) : '';
 
-	$error  = '';
-	$result = null;
-	$email  = '';
-
-	if ( isset( $_SERVER['REQUEST_METHOD'], $_POST['nshmsv_action'] ) && 'POST' === $_SERVER['REQUEST_METHOD'] && 'verify_email' === sanitize_key( wp_unslash( $_POST['nshmsv_action'] ) ) ) {
-		if ( ! isset( $_POST['nshmsv_verify_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nshmsv_verify_nonce'] ) ), 'nshmsv_verify_email' ) ) {
+	if ( 'login' === $action && isset( $_SERVER['REQUEST_METHOD'] ) && 'POST' === $_SERVER['REQUEST_METHOD'] ) {
+		if ( ! isset( $_POST['nshmsv_login_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nshmsv_login_nonce'] ) ), 'nshmsv_login' ) ) {
 			$error = 'Your form session expired. Reload the page and try again.';
 		} else {
-			$email     = isset( $_POST['nshmsv_email'] ) ? strtolower( sanitize_email( wp_unslash( $_POST['nshmsv_email'] ) ) ) : '';
-			$event_ref = isset( $_POST['nshmsv_event_ref'] ) ? substr( sanitize_text_field( wp_unslash( $_POST['nshmsv_event_ref'] ) ), 0, 190 ) : '';
+			$login    = isset( $_POST['nshmsv_login'] ) ? sanitize_text_field( wp_unslash( $_POST['nshmsv_login'] ) ) : '';
+			$password = isset( $_POST['nshmsv_password'] ) && is_string( $_POST['nshmsv_password'] ) ? wp_unslash( $_POST['nshmsv_password'] ) : '';
+			$user     = is_email( $login ) ? get_user_by( 'email', $login ) : get_user_by( 'login', $login );
+			if ( $user ) {
+				$login = $user->user_login;
+			}
 
-			if ( ! is_email( $email ) ) {
-				$error = 'Enter a valid email address.';
+			$authenticated = wp_signon(
+				array(
+					'user_login'    => $login,
+					'user_password' => $password,
+					'remember'      => true,
+				),
+				is_ssl()
+			);
+
+			if ( is_wp_error( $authenticated ) ) {
+				$error = 'The username/email or password was not recognized. Please try again.';
 			} else {
-				$existing_code = nshmsv_existing_event_code( $email, $event_ref );
-				$member        = nshmsv_get_member( $email );
-
-				if ( $existing_code ) {
-					$result = array(
-						'code'   => $existing_code,
-						'status' => $member ? $member->membership_status : 'trial',
-					);
-				} elseif ( $member && 'paid' === $member->membership_status ) {
-					$code = nshmsv_create_code( $email, $event_ref );
-					if ( is_wp_error( $code ) ) {
-						$error = $code->get_error_message();
-					} else {
-						$result = array(
-							'code'   => $code,
-							'status' => 'paid',
-						);
-					}
-				} elseif ( $member ) {
-					if ( (int) $member->trials_used >= NSHMSV_TRIAL_LIMIT ) {
-						$member->membership_status = 'unpaid';
-						$wpdb_result = $wpdb->update(
-							nshmsv_members_table(),
-							array(
-								'membership_status' => 'unpaid',
-								'updated_at'        => current_time( 'mysql' ),
-							),
-							array( 'email' => $email ),
-							array( '%s', '%s' ),
-							array( '%s' )
-						);
-						if ( false === $wpdb_result ) {
-							$error = 'Your membership status could not be checked. Please try again.';
-						}
-					}
-
-					if ( '' === $error ) {
-						$token = nshmsv_new_flow( $email, $event_ref, 'payment', $member->full_name );
-						nshmsv_redirect_to( add_query_arg( 'nshmsv_flow', $token, nshmsv_page_url( 'nshmsv_payment_page_id' ) ) );
-					}
-				} else {
-					$token = nshmsv_new_flow( $email, $event_ref, 'signup' );
-					nshmsv_redirect_to( add_query_arg( 'nshmsv_flow', $token, nshmsv_page_url( 'nshmsv_signup_page_id' ) ) );
-				}
+				wp_set_current_user( $authenticated->ID );
 			}
 		}
 	}
 
-	$event_ref = nshmsv_get_event_ref();
+	if ( is_user_logged_in() && '' === $error ) {
+		$user      = wp_get_current_user();
+		$site_role = nshmsv_get_site_role( $user->ID );
+		if ( 'active' === $site_role ) {
+			$existing_code = nshmsv_existing_event_code( $user->user_email, $event_ref );
+			$code          = $existing_code ? $existing_code : nshmsv_create_code( $user->user_email, $event_ref );
+			if ( is_wp_error( $code ) ) {
+				$error = $code->get_error_message();
+			} else {
+				$result = array(
+					'code'   => $code,
+					'status' => 'active',
+				);
+			}
+		} elseif ( in_array( $site_role, array( 'unpaid', 'expired' ), true ) ) {
+			$existing_code = nshmsv_existing_event_code( $user->user_email, $event_ref );
+			if ( $existing_code ) {
+				$member = nshmsv_get_member( $user->user_email );
+				$result = array(
+					'code'   => $existing_code,
+					'status' => $member ? $member->membership_status : 'unpaid',
+				);
+			} else {
+				$full_name = trim( $user->first_name . ' ' . $user->last_name );
+				if ( '' === $full_name ) {
+					$full_name = $user->display_name;
+				}
+				if ( ! nshmsv_get_member( $user->user_email ) && ! nshmsv_upsert_member( $user->user_email, $full_name, 'unpaid', 0 ) ) {
+					$error = 'Your membership status could not be checked. Please try again.';
+				} else {
+					$token = nshmsv_new_flow(
+						$user->user_email,
+						$event_ref,
+						'payment',
+						$full_name,
+						array(
+							'flow_type' => 'existing',
+							'user_id'   => $user->ID,
+						)
+					);
+					nshmsv_redirect_to( add_query_arg( 'nshmsv_flow', $token, nshmsv_page_url( 'nshmsv_payment_page_id' ) ) );
+				}
+			}
+		} else {
+			$error = 'Your Site Role does not allow verification. Please contact the Membership Secretary.';
+		}
+	}
+
 	ob_start();
 	?>
 	<div class="nshmsv-portal">
 		<h2>Membership Verification</h2>
-		<?php if ( '' !== $error ) : ?>
-			<p role="alert"><?php echo esc_html( $error ); ?></p>
-		<?php endif; ?>
+		<?php if ( '' !== $error ) : ?><p role="alert"><?php echo esc_html( $error ); ?></p><?php endif; ?>
 		<?php if ( $result ) : ?>
 			<?php echo nshmsv_render_code_result( $result ); ?>
-		<?php else : ?>
+		<?php elseif ( ! is_user_logged_in() ) : ?>
+			<h3>Log in to your membership account</h3>
 			<form method="post">
-				<input type="hidden" name="nshmsv_action" value="verify_email">
-				<input type="hidden" name="nshmsv_event_ref" value="<?php echo esc_attr( $event_ref ); ?>">
-				<?php wp_nonce_field( 'nshmsv_verify_email', 'nshmsv_verify_nonce' ); ?>
-				<p><label for="nshmsv-email">Email address</label><br><input id="nshmsv-email" name="nshmsv_email" type="email" maxlength="190" required></p>
-				<p><button type="submit">Continue</button></p>
+				<input type="hidden" name="nshmsv_action" value="login">
+				<?php wp_nonce_field( 'nshmsv_login', 'nshmsv_login_nonce' ); ?>
+				<p><label for="nshmsv-login">Username or email</label><br><input id="nshmsv-login" name="nshmsv_login" type="text" autocomplete="username" required></p>
+				<p><label for="nshmsv-password">Password</label><br><input id="nshmsv-password" name="nshmsv_password" type="password" autocomplete="current-password" required></p>
+				<p><button type="submit">Log in and verify</button></p>
 			</form>
+			<p>New to NSH? <a href="<?php echo esc_url( $signup_url ); ?>">Sign up for membership</a>.</p>
 		<?php endif; ?>
 	</div>
 	<?php
@@ -484,28 +579,49 @@ add_shortcode( 'nshmsv_verification', 'nshmsv_verification_shortcode' );
 
 function nshmsv_signup_shortcode() {
 	$error = '';
-	$token = nshmsv_flow_key();
-	$flow  = nshmsv_get_flow( $token, 'signup' );
-
-	if ( ! $flow ) {
-		return '<p>This sign-up link has expired. Return to the verification page and try again.</p>';
+	$first_name = '';
+	$last_name  = '';
+	$email      = '';
+	$experience = '';
+	$event_ref  = nshmsv_get_event_ref();
+	$login_url  = nshmsv_page_url( 'nshmsv_verification_page_id' );
+	if ( '' !== $event_ref ) {
+		$login_url = add_query_arg( 'event', $event_ref, $login_url );
 	}
+	$action     = isset( $_POST['nshmsv_action'] ) && is_string( $_POST['nshmsv_action'] ) ? sanitize_key( wp_unslash( $_POST['nshmsv_action'] ) ) : '';
 
-	if ( isset( $_SERVER['REQUEST_METHOD'], $_POST['nshmsv_action'] ) && 'POST' === $_SERVER['REQUEST_METHOD'] && 'signup' === sanitize_key( wp_unslash( $_POST['nshmsv_action'] ) ) ) {
-		if ( ! isset( $_POST['nshmsv_signup_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nshmsv_signup_nonce'] ) ), 'nshmsv_signup_' . $token ) ) {
-			$error = 'Your form session expired. Return to the verification page and try again.';
+	if ( 'signup' === $action && isset( $_SERVER['REQUEST_METHOD'] ) && 'POST' === $_SERVER['REQUEST_METHOD'] ) {
+		if ( ! isset( $_POST['nshmsv_signup_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nshmsv_signup_nonce'] ) ), 'nshmsv_signup' ) ) {
+			$error = 'Your form session expired. Reload the page and try again.';
 		} else {
-			$full_name = isset( $_POST['nshmsv_name'] ) ? sanitize_text_field( wp_unslash( $_POST['nshmsv_name'] ) ) : '';
-			if ( '' === $full_name ) {
-				$error = 'Enter your name.';
+			$email      = isset( $_POST['nshmsv_email'] ) ? strtolower( sanitize_email( wp_unslash( $_POST['nshmsv_email'] ) ) ) : '';
+			$first_name = isset( $_POST['nshmsv_first_name'] ) ? sanitize_text_field( wp_unslash( $_POST['nshmsv_first_name'] ) ) : '';
+			$last_name  = isset( $_POST['nshmsv_last_name'] ) ? sanitize_text_field( wp_unslash( $_POST['nshmsv_last_name'] ) ) : '';
+			$experience = isset( $_POST['nshmsv_hike_experience'] ) ? sanitize_textarea_field( wp_unslash( $_POST['nshmsv_hike_experience'] ) ) : '';
+
+			if ( ! is_email( $email ) || '' === $first_name || '' === $last_name || '' === $experience ) {
+				$error = 'Enter a valid email address, first name, last name, and short hike experience.';
+			} elseif ( get_user_by( 'email', $email ) ) {
+				$error = 'An account already uses this email address. Please log in to continue.';
 			} else {
-				$member = nshmsv_get_member( $flow['email'] );
-				if ( ! $member && ! nshmsv_upsert_member( $flow['email'], $full_name, 'trial', 0 ) ) {
+				$full_name  = trim( $first_name . ' ' . $last_name );
+				$signup_data = array(
+					'first_name'            => $first_name,
+					'last_name'             => $last_name,
+					'short_hike_experience' => $experience,
+				);
+				$member      = nshmsv_get_member( $email );
+				$trials_used = $member ? (int) $member->trials_used : 0;
+				if ( ! nshmsv_upsert_member( $email, $full_name, 'trial', $trials_used, $signup_data ) ) {
 					$error = 'Your sign-up could not be saved. Please try again.';
 				} else {
-					$flow['full_name'] = $member && '' !== $member->full_name ? $member->full_name : $full_name;
-					$flow['step']      = 'payment';
-					set_transient( 'nshmsv_flow_' . $token, $flow, 30 * MINUTE_IN_SECONDS );
+					$token = nshmsv_new_flow(
+						$email,
+						$event_ref,
+						'payment',
+						$full_name,
+						array_merge( $signup_data, array( 'flow_type' => 'signup' ) )
+					);
 					nshmsv_redirect_to( add_query_arg( 'nshmsv_flow', $token, nshmsv_page_url( 'nshmsv_payment_page_id' ) ) );
 				}
 			}
@@ -515,16 +631,18 @@ function nshmsv_signup_shortcode() {
 	ob_start();
 	?>
 	<div class="nshmsv-portal">
-		<h2>Create your membership record</h2>
-		<p>Email: <?php echo esc_html( $flow['email'] ); ?></p>
+		<h2>Membership sign-up</h2>
 		<?php if ( '' !== $error ) : ?><p role="alert"><?php echo esc_html( $error ); ?></p><?php endif; ?>
 		<form method="post">
 			<input type="hidden" name="nshmsv_action" value="signup">
-			<input type="hidden" name="nshmsv_flow" value="<?php echo esc_attr( $token ); ?>">
-			<?php wp_nonce_field( 'nshmsv_signup_' . $token, 'nshmsv_signup_nonce' ); ?>
-			<p><label for="nshmsv-name">Full name</label><br><input id="nshmsv-name" name="nshmsv_name" type="text" maxlength="190" required></p>
-			<p><button type="submit">Continue to payment options</button></p>
+			<?php wp_nonce_field( 'nshmsv_signup', 'nshmsv_signup_nonce' ); ?>
+			<p><label for="nshmsv-signup-email">Email address</label><br><input id="nshmsv-signup-email" name="nshmsv_email" type="email" maxlength="190" value="<?php echo esc_attr( $email ); ?>" required></p>
+			<p><label for="nshmsv-first-name">First name</label><br><input id="nshmsv-first-name" name="nshmsv_first_name" type="text" maxlength="100" value="<?php echo esc_attr( $first_name ); ?>" required></p>
+			<p><label for="nshmsv-last-name">Last name</label><br><input id="nshmsv-last-name" name="nshmsv_last_name" type="text" maxlength="100" value="<?php echo esc_attr( $last_name ); ?>" required></p>
+			<p><label for="nshmsv-hike-experience">Short hike experience</label><br><textarea id="nshmsv-hike-experience" name="nshmsv_hike_experience" rows="5" maxlength="2000" required><?php echo esc_textarea( $experience ); ?></textarea></p>
+			<p><button type="submit">Continue to membership options</button></p>
 		</form>
+		<p>Already have an account? <a href="<?php echo esc_url( $login_url ); ?>">Log in</a>.</p>
 	</div>
 	<?php
 	return ob_get_clean();
@@ -541,6 +659,35 @@ function nshmsv_payment_shortcode() {
 		return '<p>This payment link has expired. Return to the verification page and try again.</p>';
 	}
 
+	$is_signup = isset( $flow['flow_type'] ) && 'signup' === $flow['flow_type'];
+	if ( ! $is_signup ) {
+		if (
+			! isset( $flow['flow_type'], $flow['user_id'] ) ||
+			'existing' !== $flow['flow_type'] ||
+			! is_user_logged_in() ||
+			get_current_user_id() !== (int) $flow['user_id']
+		) {
+			return '<p>This payment link is not valid for your account. Return to the verification page and log in.</p>';
+		}
+
+		$site_role = nshmsv_get_site_role( get_current_user_id() );
+		if ( 'active' === $site_role ) {
+			$existing_code = nshmsv_existing_event_code( $flow['email'], $flow['event_ref'] );
+			$code          = $existing_code ? $existing_code : nshmsv_create_code( $flow['email'], $flow['event_ref'] );
+			if ( is_wp_error( $code ) ) {
+				return '<p role="alert">' . esc_html( $code->get_error_message() ) . '</p>';
+			}
+
+			delete_transient( 'nshmsv_flow_' . $token );
+			return '<div class="nshmsv-portal">' . nshmsv_render_code_result( array( 'code' => $code, 'status' => 'active' ) ) . '</div>';
+		}
+		if ( ! in_array( $site_role, array( 'unpaid', 'expired' ), true ) ) {
+			return '<p>Your Site Role does not allow verification. Please contact the Membership Secretary.</p>';
+		}
+	} elseif ( get_user_by( 'email', $flow['email'] ) ) {
+		return '<p>An account already uses this email address. Please <a href="' . esc_url( nshmsv_page_url( 'nshmsv_verification_page_id' ) ) . '">log in</a> to continue.</p>';
+	}
+
 	$member = nshmsv_get_member( $flow['email'] );
 	if ( ! $member ) {
 		return '<p>Your membership record could not be found. Return to the verification page and try again.</p>';
@@ -551,7 +698,7 @@ function nshmsv_payment_shortcode() {
 			$error = 'Your form session expired. Reload this page and try again.';
 		} else {
 			$choice = isset( $_POST['nshmsv_choice'] ) ? sanitize_key( wp_unslash( $_POST['nshmsv_choice'] ) ) : '';
-			$result = nshmsv_complete_payment( $flow['email'], $flow['full_name'], $flow['event_ref'], $choice );
+			$result = nshmsv_complete_payment( $flow['email'], $flow['full_name'], $flow['event_ref'], $choice, $is_signup );
 			if ( is_wp_error( $result ) ) {
 				$error  = $result->get_error_message();
 				$result = null;
@@ -565,32 +712,29 @@ function nshmsv_payment_shortcode() {
 		return '<div class="nshmsv-portal">' . nshmsv_render_code_result( $result ) . '</div>';
 	}
 
-	$can_trial = 'paid' !== $member->membership_status && (int) $member->trials_used < NSHMSV_TRIAL_LIMIT;
+	$can_trial = $is_signup && (int) $member->trials_used < NSHMSV_TRIAL_LIMIT;
 	ob_start();
 	?>
 	<div class="nshmsv-portal">
-		<h2>Payment options</h2>
+		<h2>Membership payment options</h2>
 		<p>Email: <?php echo esc_html( $flow['email'] ); ?></p>
-		<?php if ( 'paid' === $member->membership_status ) : ?>
-			<p>Your paid membership is recognized. Continue to receive your event verification code.</p>
+		<?php if ( $is_signup ) : ?>
+			<p>Choose PayPal, e-transfer, credit card, or an available trial membership. Payment selections are demonstrations only; no payment is processed or confirmed.</p>
 		<?php else : ?>
-			<p>Choose a demo payment option or use an available trial. No real payment is processed.</p>
+			<p>Choose PayPal, e-transfer, or credit card. Payment selections are demonstrations only; no payment is processed or confirmed.</p>
 		<?php endif; ?>
 		<?php if ( '' !== $error ) : ?><p role="alert"><?php echo esc_html( $error ); ?></p><?php endif; ?>
 		<form method="post">
 			<input type="hidden" name="nshmsv_action" value="complete_payment">
 			<input type="hidden" name="nshmsv_flow" value="<?php echo esc_attr( $token ); ?>">
 			<?php wp_nonce_field( 'nshmsv_payment_' . $token, 'nshmsv_payment_nonce' ); ?>
-			<?php if ( 'paid' !== $member->membership_status ) : ?>
-				<p><label><input type="radio" name="nshmsv_choice" value="credit_card" required> Pay with credit card (demo)</label></p>
-				<p><label><input type="radio" name="nshmsv_choice" value="paypal" required> Pay with PayPal (demo)</label></p>
-				<?php if ( $can_trial ) : ?>
-					<p><label><input type="radio" name="nshmsv_choice" value="trial" required> Use one trial event (<?php echo esc_html( (string) ( NSHMSV_TRIAL_LIMIT - (int) $member->trials_used ) ); ?> remaining)</label></p>
-				<?php else : ?>
-					<p>You have used all <?php echo esc_html( (string) NSHMSV_TRIAL_LIMIT ); ?> trial events. Payment is required to continue.</p>
-				<?php endif; ?>
-			<?php else : ?>
-				<input type="hidden" name="nshmsv_choice" value="paid">
+			<p><label><input type="radio" name="nshmsv_choice" value="paypal" required> PayPal (demo)</label></p>
+			<p><label><input type="radio" name="nshmsv_choice" value="etransfer" required> E-transfer (demo)</label></p>
+			<p><label><input type="radio" name="nshmsv_choice" value="credit_card" required> Credit card (demo)</label></p>
+			<?php if ( $can_trial ) : ?>
+				<p><label><input type="radio" name="nshmsv_choice" value="trial" required> Trial membership (<?php echo esc_html( (string) ( NSHMSV_TRIAL_LIMIT - (int) $member->trials_used ) ); ?> remaining)</label></p>
+			<?php elseif ( $is_signup ) : ?>
+				<p>You have used all <?php echo esc_html( (string) NSHMSV_TRIAL_LIMIT ); ?> trial memberships. Choose a payment option to continue.</p>
 			<?php endif; ?>
 			<p><button type="submit">Continue and get verification code</button></p>
 		</form>

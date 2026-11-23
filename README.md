@@ -14,7 +14,7 @@ An event-based demo with an organizer event dashboard, tokenized participant lin
 
 Folder: [`nsh_membership_simple_verification/`](./nsh_membership_simple_verification/)
 
-An email-first flow with paid/trial/unpaid status handling, sign-up and payment-demo steps, trial limits, and an organizer code-validation page. This plugin creates the pages it needs when activated.
+A WordPress-account flow that validates the user's Site Role, with membership sign-up, payment/trial demo steps, trial limits, and an organizer code-validation page. This plugin creates the pages it needs when activated.
 
 ## Install
 
